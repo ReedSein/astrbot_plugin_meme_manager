@@ -28,7 +28,7 @@ from .init import init_plugin
 
 
 @register(
-    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.20"
+    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.21"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -589,20 +589,25 @@ class MemeSender(Star):
         state_data = getattr(event, "state_data", {})
         emotions = state_data.get("found_emotions", [])
         
-        # --- 🚨 智能补救逻辑 (Rescue Logic) ---
-        # 如果之前没找到表情，但文本中依然存在标签（说明可能是 Retry 插件在后面生成的）
+        # --- 🚨 智能补救逻辑 (Rescue Logic - Aggressive) ---
+        # 无论之前有没有找到表情 (emotions 是否为空)，只要当前文本里有疑似标签，就强制重新解析
+        # 这样可以覆盖 Retry 插件重试后产生的新内容
         current_text = result.get_plain_text()
-        if not emotions and current_text:
+        if current_text:
             if "&&" in current_text or ("[" in current_text and "]" in current_text):
-                self.logger.info("检测到重试逻辑产生的残留标签，正在进行二次解析...")
+                self.logger.info(f"🛡️ 检测到潜在的残留标签（可能来自重试），强制执行二次解析: {current_text[:20]}...")
                 clean_text, new_emotions = self._process_text_for_emotions(current_text)
-                if new_emotions:
-                    # 补救成功，更新状态
+                
+                # 只有当确实找到了新表情，或者清理了文本时，才更新状态
+                if new_emotions or clean_text != current_text:
+                    # 更新状态 (合并还是覆盖？这里选择覆盖，以当前文本为准)
                     emotions = new_emotions
                     if not hasattr(event, "state_data"): event.state_data = {}
                     event.state_data["found_emotions"] = emotions
-                    # 更新当前文本链为清理后的文本
+                    
+                    # 立即更新文本链，防止残留标签被发送
                     result.chain = [Plain(clean_text)]
+                    self.logger.info(f"✅ 二次解析成功，提取表情: {new_emotions}，文本已净化。")
 
         if not emotions:
             return
