@@ -28,28 +28,76 @@ from .init import init_plugin
 
 
 @register(
-    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.18"
+    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.20"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
 
-        # 初始化插件
+        # 初始化插件环境
         if not init_plugin():
             raise RuntimeError("插件初始化失败")
 
-        # 初始化类别管理器
+        # 初始化核心组件
         self.category_manager = CategoryManager()
-
-        # 初始化图床同步客户端
+        
+        # 初始化图床组件
         self.img_sync = None
+        self._init_image_host()
+
+        # 初始化 WebUI 进程管理
+        self.webui_process = None
+        self.server_key = None
+        self.server_port = self.config.get("webui_port", 5000)
+
+        # 初始化上传会话状态
+        self.upload_states = {}  # {user_session: {"category": str, "expire_time": float}}
+
+        # 初始化日志
+        self.logger = logging.getLogger(__name__)
+
+        # 记录 R2 初始化日志（如果已初始化）
+        if hasattr(self, "_r2_bucket_name"):
+            self.logger.info(f"Cloudflare R2 图床已初始化: {self._r2_bucket_name}")
+            delattr(self, "_r2_bucket_name")
+
+        # 加载 Prompt 配置
+        self.prompt_head = self.config.get("prompt", {}).get("prompt_head", "")
+        self.prompt_tail_1 = self.config.get("prompt", {}).get("prompt_tail_1", "")
+        self.prompt_tail_2 = self.config.get("prompt", {}).get("prompt_tail_2", "")
+        self.max_emotions_per_message = self.config.get("max_emotions_per_message", 1)
+        self.emotions_probability = self.config.get("emotions_probability", 80)
+        self.content_cleanup_rule = self.config.get("content_cleanup_rule", "&&[a-zA-Z]*&&")
+
+        # --- 性能优化：预编译正则表达式 ---
+        self.regex_hex = re.compile(r"&&([^&&]+)&&")
+        self.regex_bracket = re.compile(r"\[([^\[\]]+)\]")
+        self.regex_paren = re.compile(r"\(([^()]+)\)")
+        
+        # --- 性能优化：IO 缓存层 ---
+        # image_cache: {category_name: [filename1, filename2, ...]}
+        self.image_cache = {}  
+        # meme_queues: {category_name: [filenameX, filenameY...]} 用于洗牌去重
+        self.meme_queues = {}  
+        
+        # 初始加载缓存
+        self._refresh_image_cache()
+
+        # 读取容错符
+        self.fault_tolerant_symbols = self.config.get("fault_tolerant_symbols", ["⬡"])
+
+        # 处理人格注入
+        personas = self.context.provider_manager.personas
+        self.persona_backup = copy.deepcopy(personas)
+        self._reload_personas()
+
+    def _init_image_host(self):
+        """初始化图床配置"""
         image_host_type = self.config.get("image_host", "stardots")
 
         if image_host_type == "stardots":
-            stardots_config = self.config.get("image_host_config", {}).get(
-                "stardots", {}
-            )
+            stardots_config = self.config.get("image_host_config", {}).get("stardots", {})
             if stardots_config.get("key") and stardots_config.get("secret"):
                 self.img_sync = ImageSync(
                     config={
@@ -61,78 +109,80 @@ class MemeSender(Star):
                     provider_type="stardots",
                 )
         elif image_host_type == "cloudflare_r2":
-            r2_config = self.config.get("image_host_config", {}).get(
-                "cloudflare_r2", {}
-            )
-            required_fields = [
-                "account_id",
-                "access_key_id",
-                "secret_access_key",
-                "bucket_name",
-            ]
+            r2_config = self.config.get("image_host_config", {}).get("cloudflare_r2", {})
+            required_fields = ["account_id", "access_key_id", "secret_access_key", "bucket_name"]
             if all(r2_config.get(field) for field in required_fields):
-                # 确保 public_url 不以斜杠结尾
                 if r2_config.get("public_url"):
                     r2_config["public_url"] = r2_config["public_url"].rstrip("/")
                 self.img_sync = ImageSync(
                     config=r2_config, local_dir=MEMES_DIR, provider_type="cloudflare_r2"
                 )
-                # 延迟日志记录，避免 logger 未初始化
                 self._r2_bucket_name = r2_config.get("bucket_name")
 
-        # 用于管理服务器
-        self.webui_process = None
+    def _refresh_image_cache(self):
+        """性能优化：刷新图片文件索引缓存"""
+        new_cache = {}
+        # 清空洗牌队列，确保新图片被加入
+        self.meme_queues = {}
+        
+        if not os.path.exists(MEMES_DIR):
+            self.logger.warning(f"表情包根目录不存在: {MEMES_DIR}")
+            return
 
-        self.server_key = None
-        self.server_port = self.config.get("webui_port", 5000)
+        for emotion_name in self.category_manager.get_descriptions().keys():
+            emotion_path = os.path.join(MEMES_DIR, emotion_name)
+            if os.path.exists(emotion_path):
+                # 仅缓存文件名，减少内存占用
+                files = [
+                    f for f in os.listdir(emotion_path) 
+                    if f.lower().endswith(('.jpg', '.png', '.gif', '.jpeg', '.webp'))
+                ]
+                if files:
+                    new_cache[emotion_name] = files
+        
+        self.image_cache = new_cache
+        self.logger.info(f"表情包缓存已更新，共加载 {len(new_cache)} 个分类的图片索引")
 
-        # 初始化表情状态
-        self.found_emotions = []  # 存储找到的表情
-        self.upload_states = {}  # 存储上传状态：{user_session: {"category": str, "expire_time": float}}
-        self.pending_images = {}  # 存储待发送的图片
+    def _get_next_meme(self, category: str) -> str | None:
+        """体验优化：使用洗牌算法获取下一张图片，防止重复"""
+        if category not in self.image_cache:
+            return None
+            
+        # 如果队列为空，从缓存重新填充并洗牌
+        if not self.meme_queues.get(category):
+            original_list = self.image_cache.get(category, [])
+            if not original_list:
+                return None
+            # 创建副本并洗牌
+            shuffled = original_list.copy()
+            random.shuffle(shuffled)
+            self.meme_queues[category] = shuffled
+            
+        return self.meme_queues[category].pop()
 
-        # 读取表情包分隔符
-        self.fault_tolerant_symbols = self.config.get("fault_tolerant_symbols", ["⬡"])
-
-        # 初始化 logger
-        self.logger = logging.getLogger(__name__)
-
-        # 记录 R2 初始化日志（如果已初始化）
-        if hasattr(self, "_r2_bucket_name"):
-            self.logger.info(f"Cloudflare R2 图床已初始化: {self._r2_bucket_name}")
-            delattr(self, "_r2_bucket_name")
-
-        # 处理人格
-        self.prompt_head = self.config.get("prompt").get("prompt_head")
-        self.prompt_tail_1 = self.config.get("prompt").get("prompt_tail_1")
-        self.prompt_tail_2 = self.config.get("prompt").get("prompt_tail_2")
-        self.max_emotions_per_message = self.config.get("max_emotions_per_message")
-        self.emotions_probability = self.config.get("emotions_probability")
-        self.strict_max_emotions_per_message = self.config.get(
-            "strict_max_emotions_per_message"
+    def _reload_personas(self):
+        """重新注入人格"""
+        self.category_mapping = load_json(MEMES_DATA_PATH, DEFAULT_CATEGORY_DESCRIPTIONS)
+        # 配置变更时刷新缓存
+        self._refresh_image_cache()
+        
+        self.category_mapping_string = dict_to_string(self.category_mapping)
+        self.sys_prompt_add = (
+            self.prompt_head
+            + self.category_mapping_string
+            + self.prompt_tail_1
+            + str(self.max_emotions_per_message)
+            + self.prompt_tail_2
         )
-
-        # 内容清理规则
-        self.content_cleanup_rule = self.config.get(
-            "content_cleanup_rule", "&&[a-zA-Z]*&&"
-        )
-
-        # 更新人格
         personas = self.context.provider_manager.personas
-        self.persona_backup = copy.deepcopy(personas)
-        self._reload_personas()
+        for persona, persona_backup in zip(personas, self.persona_backup):
+            persona["prompt"] = persona_backup["prompt"] + self.sys_prompt_add
+
+    # ==================== WebUI 管理命令 ====================
 
     @filter.command_group("表情管理")
     def meme_manager(self):
-        """表情包管理命令组:
-        开启管理后台
-        关闭管理后台
-        查看图库
-        添加表情
-        同步状态
-        同步到云端
-        从云端同步
-        """
+        """表情包管理命令组"""
         pass
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -145,15 +195,13 @@ class MemeSender(Star):
             state = ServerState()
             state.ready.clear()
 
-            # 生成秘钥
             self.server_key = generate_secret_key(8)
             self.server_port = self.config.get("webui_port", 5000)
 
-            # 检查端口占用情况
             if await self._check_port_active():
                 yield event.plain_result("🔧 检测到端口占用，正在尝试自动释放...")
                 await self._shutdown()
-                await asyncio.sleep(1)  # 等待系统释放端口
+                await asyncio.sleep(1)
 
             config_for_server = {
                 "img_sync": self.img_sync,
@@ -164,7 +212,6 @@ class MemeSender(Star):
             self.webui_process = Process(target=run_server, args=(config_for_server,))
             self.webui_process.start()
 
-            # 等待服务器就绪（轮询检测端口激活）
             for i in range(10):
                 if await self._check_port_active():
                     break
@@ -172,7 +219,6 @@ class MemeSender(Star):
             else:
                 raise RuntimeError("⌛ 启动超时，请检查防火墙设置")
 
-            # 获取公网IP并返回结果
             public_ip = await get_public_ip()
             yield event.plain_result(
                 f"✨ 管理后台已就绪！\n"
@@ -188,13 +234,10 @@ class MemeSender(Star):
 
         except Exception as e:
             self.logger.error(f"启动失败: {str(e)}")
-            yield event.plain_result(
-                f"⚠️ 后台启动失败，请稍后重试\n（错误代码：{str(e)}）"
-            )
+            yield event.plain_result(f"⚠️ 后台启动失败，请稍后重试\n（错误代码：{str(e)}）")
             await self._cleanup_resources()
 
     async def _check_port_active(self):
-        """验证端口是否实际已激活"""
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.server_port), timeout=1
@@ -207,9 +250,8 @@ class MemeSender(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("关闭管理后台")
     async def stop_server(self, event: AstrMessageEvent):
-        """关闭表情包管理服务器的指令"""
+        """关闭表情包管理服务器"""
         yield event.plain_result("🚪 管理后台正在关闭，稍后见~ ✨")
-
         try:
             await self._shutdown()
             yield event.plain_result("✅ 服务器已关闭")
@@ -235,27 +277,13 @@ class MemeSender(Star):
         self.webui_process = None
         self.logger.info("资源清理完成")
 
-    def _reload_personas(self):
-        """重新注入人格"""
-        self.category_mapping = load_json(
-            MEMES_DATA_PATH, DEFAULT_CATEGORY_DESCRIPTIONS
-        )
-        self.category_mapping_string = dict_to_string(self.category_mapping)
-        self.sys_prompt_add = (
-            self.prompt_head
-            + self.category_mapping_string
-            + self.prompt_tail_1
-            + str(self.max_emotions_per_message)
-            + self.prompt_tail_2
-        )
-        personas = self.context.provider_manager.personas
-        for persona, persona_backup in zip(personas, self.persona_backup):
-            persona["prompt"] = persona_backup["prompt"] + self.sys_prompt_add
+    # ==================== 表情包操作命令 ====================
 
     @meme_manager.command("查看图库")
     async def list_emotions(self, event: AstrMessageEvent):
         """查看所有可用表情包类别"""
-        descriptions = self.category_mapping
+        # 使用 category_manager 获取，保证数据最新
+        descriptions = self.category_manager.get_descriptions()
         categories = "\n".join(
             [f"- {tag}: {desc}" for tag, desc in descriptions.items()]
         )
@@ -298,55 +326,44 @@ class MemeSender(Star):
             return
 
         images = [c for c in event.message_obj.message if isinstance(c, Image)]
-
         if not images:
             yield event.plain_result("请发送图片文件来进行上传哦。")
             return
 
         category = upload_state["category"]
         save_dir = os.path.join(MEMES_DIR, category)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        saved_files = []
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
 
         try:
-            os.makedirs(save_dir, exist_ok=True)
-            saved_files = []
-
-            # 创建忽略 SSL 验证的上下文
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-
             for idx, img in enumerate(images, 1):
                 timestamp = int(time.time())
-
                 try:
+                    target_url = img.url
                     # 特殊处理腾讯多媒体域名
-                    if "multimedia.nt.qq.com.cn" in img.url:
-                        insecure_url = img.url.replace("https://", "http://", 1)
-                        self.logger.warning(
-                            f"检测到腾讯多媒体域名，使用 HTTP 协议下载: {insecure_url}"
-                        )
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(insecure_url) as resp:
-                                content = await resp.read()
-                    else:
-                        async with aiohttp.ClientSession(
-                            connector=aiohttp.TCPConnector(ssl=ssl_context)
-                        ) as session:
-                            async with session.get(img.url) as resp:
-                                content = await resp.read()
+                    if "multimedia.nt.qq.com.cn" in target_url:
+                        target_url = target_url.replace("https://", "http://", 1)
 
+                    async with aiohttp.ClientSession(
+                        connector=aiohttp.TCPConnector(ssl=ssl_context)
+                    ) as session:
+                        async with session.get(target_url) as resp:
+                            content = await resp.read()
+
+                    # 图片格式检测
+                    file_type = "unknown"
                     try:
-                        with PILImage.open(io.BytesIO(content)) as img:
-                            file_type = img.format.lower()
-                    except Exception as e:
-                        self.logger.error(f"图片格式检测失败: {str(e)}")
-                        file_type = "unknown"
+                        with PILImage.open(io.BytesIO(content)) as pi:
+                            file_type = pi.format.lower()
+                    except Exception: pass
 
                     ext_mapping = {
-                        "jpeg": ".jpg",
-                        "png": ".png",
-                        "gif": ".gif",
-                        "webp": ".webp",
+                        "jpeg": ".jpg", "png": ".png", 
+                        "gif": ".gif", "webp": ".webp"
                     }
                     ext = ext_mapping.get(file_type, ".bin")
                     filename = f"{timestamp}_{idx}{ext}"
@@ -358,26 +375,19 @@ class MemeSender(Star):
 
                 except Exception as e:
                     self.logger.error(f"下载图片失败: {str(e)}")
-                    yield event.plain_result(f"文件 {img.url} 下载失败啦: {str(e)}")
+                    yield event.plain_result(f"文件 {img.url} 下载失败: {str(e)}")
                     continue
 
             del self.upload_states[user_key]
 
-            # 基础成功消息
-            result_msg = [
-                Plain(
-                    f"✅ 已经成功收录了 {len(saved_files)} 张新表情到「{category}」图库！"
-                )
-            ]
+            # 关键：上传后刷新缓存
+            self._refresh_image_cache()
 
-            # 如果配置了图床，提示用户需要手动同步
+            msg = [Plain(f"✅ 已经成功收录了 {len(saved_files)} 张新表情到「{category}」图库！")]
             if self.img_sync:
-                result_msg.append(Plain("\n"))
-                result_msg.append(
-                    Plain("☁️ 检测到已配置图床，如需同步到云端请使用命令：同步到云端")
-                )
+                msg.append(Plain("\n\n☁️ 检测到已配置图床，如需同步到云端请使用命令：同步到云端"))
 
-            yield event.chain_result(result_msg)
+            yield event.chain_result(msg)
             await self.reload_emotions()
 
         except Exception as e:
@@ -387,279 +397,214 @@ class MemeSender(Star):
         """动态重新加载表情配置"""
         try:
             self.category_manager.sync_with_filesystem()
-
+            self._refresh_image_cache() # 确保缓存也是最新的
         except Exception as e:
             self.logger.error(f"重新加载表情配置失败: {str(e)}")
 
-    def _check_meme_directories(self):
-        """检查表情包目录是否存在并且包含图片"""
-        self.logger.info(f"开始检查表情包根目录: {MEMES_DIR}")
-        if not os.path.exists(MEMES_DIR):
-            self.logger.error(f"表情包根目录不存在，请检查: {MEMES_DIR}")
-            return
+    # ==================== 核心逻辑：表情解析与状态管理 ====================
 
-        for emotion in self.category_manager.get_descriptions().values():
-            emotion_path = os.path.join(MEMES_DIR, emotion)
-            if not os.path.exists(emotion_path):
-                self.logger.error(
-                    f"表情分类 {emotion} 对应的目录不存在，请查看: {emotion_path}"
-                )
-                continue
+    def _process_text_for_emotions(self, text: str) -> tuple[str, list[str]]:
+        """
+        核心逻辑提取：输入原始文本，返回 (清理后的文本, 找到的表情列表)
+        解耦逻辑，便于在 resp 和 on_decorating_result 中复用
+        """
+        if not text:
+            return text, []
 
-            memes = [
-                f
-                for f in os.listdir(emotion_path)
-                if f.endswith((".jpg", ".png", ".gif"))
-            ]
-            if not memes:
-                self.logger.error(f"表情分类 {emotion} 对应的目录为空: {emotion_path}")
-            else:
-                self.logger.info(
-                    f"表情分类 {emotion} 对应的目录 {emotion_path} 包含 {len(memes)} 个图片"
-                )
-
-    @filter.on_llm_response(priority=99999)
-    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
-        """处理 LLM 响应，识别表情"""
-
-        if not response or not response.completion_text:
-            return
-
-        text = response.completion_text
-        self.found_emotions = []  # 重置表情列表
-        valid_emoticons = set(self.category_mapping.keys())  # 预加载合法表情集合
-
+        found_emotions = []
+        valid_emoticons = set(self.category_mapping.keys())
         clean_text = text
 
-        # 第一阶段：严格匹配符号包裹的表情
-        hex_pattern = r"&&([^&&]+)&&"
-        matches = re.finditer(hex_pattern, clean_text)
-
-        # 严格模式处理
+        # --- 第一阶段：严格匹配 &&emotion&& (使用预编译正则) ---
+        matches = list(self.regex_hex.finditer(clean_text))
         temp_replacements = []
+        
         for match in matches:
             original = match.group(0)
             emotion = match.group(1).strip()
-
-            # 合法性验证
             if emotion in valid_emoticons:
                 temp_replacements.append((original, emotion))
             else:
-                temp_replacements.append((original, ""))  # 非法表情静默移除
+                temp_replacements.append((original, "")) # 非法表情静默移除
 
-        # 保持原始顺序替换
         for original, emotion in temp_replacements:
-            clean_text = clean_text.replace(original, "", 1)  # 每次替换第一个匹配项
+            clean_text = clean_text.replace(original, "", 1)
             if emotion:
-                self.found_emotions.append(emotion)
+                found_emotions.append(emotion)
 
-        # 第二阶段：替代标记处理（如[emotion]、(emotion)等）
+        # --- 第二阶段：替代标记处理 [emotion] / (emotion) ---
         if self.config.get("enable_alternative_markup", True):
-            # 处理[emotion]格式
-            bracket_pattern = r"\[([^\[\]]+)\]"
-            matches = re.finditer(bracket_pattern, clean_text)
+            # [emotion]
+            matches = self.regex_bracket.finditer(clean_text)
             bracket_replacements = []
             invalid_brackets = []
-
+            
             for match in matches:
                 original = match.group(0)
                 emotion = match.group(1).strip()
-
                 if emotion in valid_emoticons:
                     bracket_replacements.append((original, emotion))
                 else:
-                    # 记录无效标记，稍后删除
                     invalid_brackets.append(original)
-
-            # 删除所有无效标记
+            
             for invalid in invalid_brackets:
                 clean_text = clean_text.replace(invalid, "", 1)
-
             for original, emotion in bracket_replacements:
                 clean_text = clean_text.replace(original, "", 1)
-                self.found_emotions.append(emotion)
+                found_emotions.append(emotion)
 
-            # 处理(emotion)格式
-            paren_pattern = r"\(([^()]+)\)"
-            matches = re.finditer(paren_pattern, clean_text)
+            # (emotion)
+            matches = self.regex_paren.finditer(clean_text)
             paren_replacements = []
             invalid_parens = []
-
             for match in matches:
                 original = match.group(0)
                 emotion = match.group(1).strip()
-
                 if emotion in valid_emoticons:
-                    # 需要额外验证，确保不是普通句子的一部分
-                    if self._is_likely_emotion_markup(
-                        original, clean_text, match.start()
-                    ):
+                    if self._is_likely_emotion_markup(original, clean_text, match.start()):
                         paren_replacements.append((original, emotion))
                 else:
-                    # 记录无效标记，稍后删除
                     invalid_parens.append(original)
-
-            # 删除所有无效标记
             for invalid in invalid_parens:
                 clean_text = clean_text.replace(invalid, "", 1)
-
             for original, emotion in paren_replacements:
                 clean_text = clean_text.replace(original, "", 1)
-                self.found_emotions.append(emotion)
+                found_emotions.append(emotion)
 
-        # 第三阶段：处理重复表情模式（如angryangryangry）
+        # --- 第三阶段：重复词模式 ---
         if self.config.get("enable_repeated_emotion_detection", True):
-            high_confidence_emotions = self.config.get("high_confidence_emotions", [])
-
+            high_confidence = self.config.get("high_confidence_emotions", [])
             for emotion in valid_emoticons:
-                # 跳过太短的表情词，避免误判
-                if len(emotion) < 3:
-                    continue
-
-                # 对高置信度表情，重复两次即可识别
-                if emotion in high_confidence_emotions:
-                    # 检测重复两次的模式，如 happyhappy
+                if len(emotion) < 3: continue
+                
+                # 动态正则需要实时构建，但只在 loop 内构建一次 pattern
+                if emotion in high_confidence:
                     repeat_pattern = f"({re.escape(emotion)})\\1{{1,}}"
-                    matches = re.finditer(repeat_pattern, clean_text)
-                    for match in matches:
-                        original = match.group(0)
-                        clean_text = clean_text.replace(original, "", 1)
-                        self.found_emotions.append(emotion)
                 else:
-                    # 普通表情词需要重复至少3次才识别
-                    # 只检查长度>=4的表情，以减少误判
-                    if len(emotion) >= 4:
-                        # 查找表情词重复3次以上的模式
-                        repeat_pattern = f"({re.escape(emotion)})\\1{{2,}}"
-                        matches = re.finditer(repeat_pattern, clean_text)
-                        for match in matches:
-                            original = match.group(0)
-                            clean_text = clean_text.replace(original, "", 1)
-                            self.found_emotions.append(emotion)
+                    if len(emotion) < 4: continue
+                    repeat_pattern = f"({re.escape(emotion)})\\1{{2,}}"
+                
+                matches = list(re.finditer(repeat_pattern, clean_text))
+                for match in matches:
+                    original = match.group(0)
+                    clean_text = clean_text.replace(original, "", 1)
+                    found_emotions.append(emotion)
 
-        # 第四阶段：智能识别可能的表情（松散模式）
+        # --- 第四阶段：松散模式 ---
         if self.config.get("enable_loose_emotion_matching", True):
-            # 查找所有可能的表情词
             for emotion in valid_emoticons:
-                # 使用单词边界确保不是其他单词的一部分
+                # 单词边界匹配
                 pattern = r"\b(" + re.escape(emotion) + r")\b"
-                for match in re.finditer(pattern, clean_text):
+                for match in list(re.finditer(pattern, clean_text)):
                     word = match.group(1)
                     position = match.start()
+                    if self._is_likely_emotion(word, clean_text, position, valid_emoticons):
+                        found_emotions.append(word)
+                        clean_text = clean_text[:position] + clean_text[position + len(word):]
 
-                    # 判断是否可能是表情而非英文单词
-                    if self._is_likely_emotion(
-                        word, clean_text, position, valid_emoticons
-                    ):
-                        # 添加到表情列表
-                        self.found_emotions.append(word)
-                        # 替换文本中的表情词
-                        clean_text = (
-                            clean_text[:position] + clean_text[position + len(word) :]
-                        )
-
-        # 去重并应用数量限制
+        # 去重与限制
         seen = set()
         filtered_emotions = []
-        for emo in self.found_emotions:
+        for emo in found_emotions:
             if emo not in seen:
                 seen.add(emo)
                 filtered_emotions.append(emo)
             if len(filtered_emotions) >= self.max_emotions_per_message:
                 break
 
-        self.found_emotions = filtered_emotions
-
-        # 防御性清理残留符号
-        clean_text = re.sub(r"&&+", "", clean_text)  # 清除未成对的&&符号
-        response.completion_text = clean_text.strip()
+        # 防御性清理残留 && 符号
+        clean_text = re.sub(r"&&+", "", clean_text).strip()
+        
+        return clean_text, filtered_emotions
 
     def _is_likely_emotion_markup(self, markup, text, position):
         """判断一个标记是否可能是表情而非普通文本的一部分"""
-        # 获取标记前后的文本
         before_text = text[:position].strip()
         after_text = text[position + len(markup) :].strip()
 
-        # 如果是在中文上下文中，更可能是表情
-        has_chinese_before = bool(
-            re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else "")
-        )
-        has_chinese_after = bool(
-            re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else "")
-        )
-        if has_chinese_before or has_chinese_after:
-            return True
+        has_chinese_before = bool(re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else ""))
+        has_chinese_after = bool(re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else ""))
+        if has_chinese_before or has_chinese_after: return True
 
-        # 如果在数字标记中，可能是引用标记如[1]，不是表情
-        if re.match(r"\[\d+\]", markup):
-            return False
-
-        # 如果标记内有空格，可能是普通句子，不是表情
-        if " " in markup[1:-1]:
-            return False
-
-        # 如果标记前后是完整的英文句子，可能不是表情
+        if re.match(r"\[\d+\]", markup): return False # 引用 [1]
+        if " " in markup[1:-1]: return False # 内部有空格
+        
         english_context_before = bool(re.search(r"[a-zA-Z]\s+$", before_text))
         english_context_after = bool(re.search(r"^\s+[a-zA-Z]", after_text))
-        if english_context_before and english_context_after:
-            return False
+        if english_context_before and english_context_after: return False
 
-        # 默认情况下认为可能是表情
         return True
 
     def _is_likely_emotion(self, word, text, position, valid_emotions):
         """判断一个单词是否可能是表情而非普通英文单词"""
-
-        # 先获取上下文
         before_text = text[:position].strip()
         after_text = text[position + len(word) :].strip()
 
-        # 规则1：检查是否在英文上下文中
-        # 如果前面有英文单词+空格，或后面有空格+英文单词，可能是英文上下文
         english_context_before = bool(re.search(r"[a-zA-Z]\s+$", before_text))
         english_context_after = bool(re.search(r"^\s+[a-zA-Z]", after_text))
 
-        # 在英文上下文中，不太可能是表情
-        if english_context_before or english_context_after:
-            return False
+        if english_context_before or english_context_after: return False
+        
+        has_chinese_before = bool(re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else ""))
+        has_chinese_after = bool(re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else ""))
+        if has_chinese_before or has_chinese_after: return True
 
-        # 规则2：前后有中文字符，更可能是表情
-        has_chinese_before = bool(
-            re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else "")
-        )
-        has_chinese_after = bool(
-            re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else "")
-        )
-
-        if has_chinese_before or has_chinese_after:
+        if not before_text or before_text.endswith(("。", "，", "！", "？", ".", ",", ":", ";", "!", "?", "\n")):
             return True
 
-        # 规则3：如果是句子开头或结尾，可能是表情
-        if not before_text or before_text.endswith(
-            ("。", "，", "！", "？", ".", ",", ":", ";", "!", "?", "\n")
-        ):
-            return True
-
-        # 规则4：如果前后都是标点或空格，可能是表情
         if (not before_text or before_text[-1] in " \t\n.,!?;:'\"()[]{}") and (
             not after_text or after_text[0] in " \t\n.,!?;:'\"()[]{}"
         ):
             return True
 
-        # 规则5：如果是已知的表情占比很高(>=70%)的单词，即使在英文上下文中也可能是表情
         if word in self.config.get("high_confidence_emotions", []):
             return True
 
         return False
 
-    @filter.on_decorating_result(priority=99999)
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """在消息发送前处理文本部分"""
-        if not self.found_emotions:
+    @filter.on_llm_response(priority=99999)
+    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
+        """处理 LLM 响应，识别表情 (Primary Parser)"""
+        if not response or not response.completion_text:
             return
 
+        # 1. 核心解析逻辑
+        clean_text, emotions = self._process_text_for_emotions(response.completion_text)
+        
+        # 2. 状态保存 (使用 event 挂载，并发安全)
+        if not hasattr(event, "state_data"):
+            event.state_data = {}
+        event.state_data["found_emotions"] = emotions
+        
+        # 3. 更新回复文本
+        response.completion_text = clean_text
+
+    @filter.on_decorating_result(priority=99999)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """在消息发送前处理文本部分 (Rescue & Cleanup)"""
         result = event.get_result()
-        if not result:
+        if not result: return
+
+        # 获取状态 (并发安全)
+        state_data = getattr(event, "state_data", {})
+        emotions = state_data.get("found_emotions", [])
+        
+        # --- 🚨 智能补救逻辑 (Rescue Logic) ---
+        # 如果之前没找到表情，但文本中依然存在标签（说明可能是 Retry 插件在后面生成的）
+        current_text = result.get_plain_text()
+        if not emotions and current_text:
+            if "&&" in current_text or ("[" in current_text and "]" in current_text):
+                self.logger.info("检测到重试逻辑产生的残留标签，正在进行二次解析...")
+                clean_text, new_emotions = self._process_text_for_emotions(current_text)
+                if new_emotions:
+                    # 补救成功，更新状态
+                    emotions = new_emotions
+                    if not hasattr(event, "state_data"): event.state_data = {}
+                    event.state_data["found_emotions"] = emotions
+                    # 更新当前文本链为清理后的文本
+                    result.chain = [Plain(clean_text)]
+
+        if not emotions:
             return
 
         try:
@@ -674,81 +619,77 @@ class MemeSender(Star):
                 elif isinstance(original_chain, list):
                     chains.extend([c for c in original_chain if isinstance(c, Plain)])
 
-            # 清理文本中的表情标签
             cleaned_chains = []
             for component in chains:
                 if isinstance(component, Plain):
                     text = component.text
-                    # 使用配置的正则表达式移除表情标签
                     if self.content_cleanup_rule:
                         text = re.sub(self.content_cleanup_rule, "", text)
-                    if text.strip():
-                        cleaned_chains.append(Plain(text))
+                    
+                    # 再次调用核心处理，确保所有标签被移除
+                    final_clean, _ = self._process_text_for_emotions(text)
+                    
+                    if final_clean.strip():
+                        cleaned_chains.append(Plain(final_clean))
 
             text_result = event.make_result().set_result_content_type(
                 ResultContentType.LLM_RESULT
             )
             for component in cleaned_chains:
-                if isinstance(component, Plain):
-                    text_result = text_result.message(component.text)
+                text_result = text_result.message(component.text)
 
             if text_result.get_plain_text().strip():
                 event.set_result(text_result)
             else:
+                # 如果只剩下表情，拦截文本发送，直接跳到 after_message_sent 发图
                 await self.after_message_sent(event)
                 event.stop_event()
 
         except Exception as e:
             self.logger.error(f"处理文本失败: {str(e)}")
             import traceback
-
             self.logger.error(traceback.format_exc())
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
         """消息发送后处理图片部分"""
-        if not self.found_emotions:
+        # 从 event 获取状态 (并发安全)
+        state_data = getattr(event, "state_data", {})
+        emotions = state_data.get("found_emotions", [])
+
+        if not emotions:
             return
 
         try:
-            for emotion in self.found_emotions:
-                if not emotion:
-                    continue
+            for emotion in emotions:
+                if not emotion: continue
 
-                emotion_path = os.path.join(MEMES_DIR, emotion)
-                if not os.path.exists(emotion_path):
-                    continue
+                # 使用 IO 优化后的洗牌队列获取图片
+                meme_file = self._get_next_meme(emotion)
+                if not meme_file: continue
 
-                memes = [
-                    f
-                    for f in os.listdir(emotion_path)
-                    if f.endswith((".jpg", ".png", ".gif"))
-                ]
-                if not memes:
-                    continue
-
-                meme = random.choice(memes)
-                meme_file = os.path.join(emotion_path, meme)
+                meme_path = os.path.join(MEMES_DIR, emotion, meme_file)
+                if not os.path.exists(meme_path): continue
 
                 if random.randint(0, 100) <= self.emotions_probability:
+                    # GeweChat 兼容性处理
                     if event.get_platform_name() == "gewechat":
-                        await event.send(
-                            MessageChain([Image.fromFileSystem(meme_file)])
-                        )
+                        await event.send(MessageChain([Image.fromFileSystem(meme_path)]))
                     else:
                         await self.context.send_message(
                             event.unified_msg_origin,
-                            MessageChain([Image.fromFileSystem(meme_file)]),
+                            MessageChain([Image.fromFileSystem(meme_path)]),
                         )
-            self.found_emotions = []
+            
+            # 清理状态，防止二次触发
+            state_data["found_emotions"] = []
 
         except Exception as e:
             self.logger.error(f"发送表情图片失败: {str(e)}")
             import traceback
-
             self.logger.error(traceback.format_exc())
-        finally:
-            self.found_emotions = []
+
+    # ==================== 同步功能命令 ====================
 
     @meme_manager.command("同步状态")
     async def check_sync_status(self, event: AstrMessageEvent):
@@ -792,9 +733,7 @@ class MemeSender(Star):
     async def sync_to_remote(self, event: AstrMessageEvent):
         """将本地表情包同步到云端"""
         if not self.img_sync:
-            yield event.plain_result(
-                "图床服务尚未配置，请先在配置文件中完成图床配置哦。"
-            )
+            yield event.plain_result("图床服务尚未配置。")
             return
 
         try:
@@ -813,9 +752,7 @@ class MemeSender(Star):
     async def sync_from_remote(self, event: AstrMessageEvent):
         """从云端同步表情包到本地"""
         if not self.img_sync:
-            yield event.plain_result(
-                "图床服务尚未配置，请先在配置文件中完成图床配置哦。"
-            )
+            yield event.plain_result("图床服务尚未配置。")
             return
 
         try:
@@ -823,7 +760,6 @@ class MemeSender(Star):
             success = await self.img_sync.start_sync("download")
             if success:
                 yield event.plain_result("从云端同步已完成！")
-                # 重新加载表情配置
                 await self.reload_emotions()
             else:
                 yield event.plain_result("从云端同步失败，请查看日志哦。")
@@ -833,12 +769,10 @@ class MemeSender(Star):
 
     async def terminate(self):
         """清理资源"""
-        # 恢复人格
         personas = self.context.provider_manager.personas
         for persona, persona_backup in zip(personas, self.persona_backup):
             persona["prompt"] = persona_backup["prompt"]
 
-        # 停止图床同步
         if self.img_sync:
             self.img_sync.stop_sync()
 
