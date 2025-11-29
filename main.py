@@ -28,7 +28,7 @@ from .init import init_plugin
 
 
 @register(
-    "meme_manager", "anka", "anka - 表情包管理器 - 支持表情包发送及表情包上传", "3.23"
+    "meme_manager", "anka", "anka - 表情包管理器 (Pro混排版)", "3.24"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -66,16 +66,16 @@ class MemeSender(Star):
         self.prompt_head = self.config.get("prompt", {}).get("prompt_head", "")
         self.prompt_tail_1 = self.config.get("prompt", {}).get("prompt_tail_1", "")
         self.prompt_tail_2 = self.config.get("prompt", {}).get("prompt_tail_2", "")
-        self.max_emotions_per_message = self.config.get("max_emotions_per_message", 1)
+        self.max_emotions_per_message = self.config.get("max_emotions_per_message", 5) # 混排模式建议调大此限制
         self.emotions_probability = self.config.get("emotions_probability", 80)
         self.content_cleanup_rule = self.config.get("content_cleanup_rule", "&&[a-zA-Z]*&&")
 
-        # --- 性能优化：预编译正则表达式 ---
+        # --- 性能优化：预编译正则表达式 (保留 v20 特性) ---
         self.regex_hex = re.compile(r"&&([^&&]+)&&")
         self.regex_bracket = re.compile(r"\[([^\[\]]+)\]")
         self.regex_paren = re.compile(r"\(([^()]+)\)")
         
-        # --- 性能优化：IO 缓存层 ---
+        # --- 性能优化：IO 缓存层 (保留 v20 特性) ---
         self.image_cache = {}  
         self.meme_queues = {}  
         self._refresh_image_cache()
@@ -95,11 +95,14 @@ class MemeSender(Star):
         if image_host_type == "stardots":
             stardots_config = self.config.get("image_host_config", {}).get("stardots", {})
             if stardots_config.get("key") and stardots_config.get("secret"):
+                # 兼容 v18 的 provider 字段
+                stardots_config["provider"] = "stardots"
                 self.img_sync = ImageSync(
                     config={
                         "key": stardots_config["key"],
                         "secret": stardots_config["secret"],
                         "space": stardots_config.get("space", "memes"),
+                        "provider": "stardots",
                     },
                     local_dir=MEMES_DIR,
                     provider_type="stardots",
@@ -110,13 +113,14 @@ class MemeSender(Star):
             if all(r2_config.get(field) for field in required_fields):
                 if r2_config.get("public_url"):
                     r2_config["public_url"] = r2_config["public_url"].rstrip("/")
+                r2_config["provider"] = "cloudflare_r2"
                 self.img_sync = ImageSync(
                     config=r2_config, local_dir=MEMES_DIR, provider_type="cloudflare_r2"
                 )
                 self._r2_bucket_name = r2_config.get("bucket_name")
 
     def _refresh_image_cache(self):
-        """性能优化：刷新图片文件索引缓存"""
+        """性能优化：刷新图片文件索引缓存 (保留 v20 特性)"""
         new_cache = {}
         self.meme_queues = {}
         
@@ -138,7 +142,7 @@ class MemeSender(Star):
         self.logger.info(f"表情包缓存已更新，共加载 {len(new_cache)} 个分类的图片索引")
 
     def _get_next_meme(self, category: str) -> str | None:
-        """体验优化：使用洗牌算法获取下一张图片，防止重复"""
+        """体验优化：使用洗牌算法获取下一张图片，防止重复 (保留 v20 特性)"""
         if category not in self.image_cache:
             return None
             
@@ -169,7 +173,7 @@ class MemeSender(Star):
         for persona, persona_backup in zip(personas, self.persona_backup):
             persona["prompt"] = persona_backup["prompt"] + self.sys_prompt_add
 
-    # ==================== WebUI 管理命令 ====================
+    # ==================== WebUI 管理命令 (v20) ====================
     @filter.command_group("表情管理")
     def meme_manager(self):
         pass
@@ -360,235 +364,261 @@ class MemeSender(Star):
         except Exception as e:
             self.logger.error(f"Reload失败: {e}")
 
-    # ==================== 核心解析逻辑 ====================
-    def _process_text_for_emotions(self, text: str) -> tuple[str, list[str]]:
-        if not text: return text, []
-
-        found_emotions = []
-        valid_emoticons = set(self.category_mapping.keys())
-        clean_text = text
-
-        # 1. 严格匹配 &&emotion&&
-        matches = list(self.regex_hex.finditer(clean_text))
-        temp_replacements = []
-        for match in matches:
-            original = match.group(0)
-            emotion = match.group(1).strip()
-            if emotion in valid_emoticons:
-                temp_replacements.append((original, emotion))
-            else:
-                temp_replacements.append((original, ""))
-
-        for original, emotion in temp_replacements:
-            clean_text = clean_text.replace(original, "", 1)
-            if emotion: found_emotions.append(emotion)
-
-        # 2. 标记处理
-        if self.config.get("enable_alternative_markup", True):
-            # [emotion]
-            matches = self.regex_bracket.finditer(clean_text)
-            bracket_replacements = []
-            invalid_brackets = []
-            for match in matches:
-                original = match.group(0)
-                emotion = match.group(1).strip()
-                if emotion in valid_emoticons:
-                    bracket_replacements.append((original, emotion))
-                else:
-                    invalid_brackets.append(original)
-            for invalid in invalid_brackets: clean_text = clean_text.replace(invalid, "", 1)
-            for original, emotion in bracket_replacements:
-                clean_text = clean_text.replace(original, "", 1)
-                found_emotions.append(emotion)
-
-            # (emotion)
-            matches = self.regex_paren.finditer(clean_text)
-            paren_replacements = []
-            invalid_parens = []
-            for match in matches:
-                original = match.group(0)
-                emotion = match.group(1).strip()
-                if emotion in valid_emoticons:
-                    if self._is_likely_emotion_markup(original, clean_text, match.start()):
-                        paren_replacements.append((original, emotion))
-                else:
-                    invalid_parens.append(original)
-            for invalid in invalid_parens: clean_text = clean_text.replace(invalid, "", 1)
-            for original, emotion in paren_replacements:
-                clean_text = clean_text.replace(original, "", 1)
-                found_emotions.append(emotion)
-
-        # 3. 重复词
-        if self.config.get("enable_repeated_emotion_detection", True):
-            high_confidence = self.config.get("high_confidence_emotions", [])
-            for emotion in valid_emoticons:
-                if len(emotion) < 3: continue
-                pattern = f"({re.escape(emotion)})\\1{{1,}}" if emotion in high_confidence else f"({re.escape(emotion)})\\1{{2,}}"
-                if len(emotion) < 4 and emotion not in high_confidence: continue
-                
-                matches = list(re.finditer(pattern, clean_text))
-                for match in matches:
-                    original = match.group(0)
-                    clean_text = clean_text.replace(original, "", 1)
-                    found_emotions.append(emotion)
-
-        # 4. 松散模式
-        if self.config.get("enable_loose_emotion_matching", True):
-            for emotion in valid_emoticons:
-                pattern = r"\b(" + re.escape(emotion) + r")\b"
-                for match in list(re.finditer(pattern, clean_text)):
-                    word = match.group(1)
-                    position = match.start()
-                    if self._is_likely_emotion(word, clean_text, position, valid_emoticons):
-                        found_emotions.append(word)
-                        clean_text = clean_text[:position] + clean_text[position + len(word):]
-
-        # 去重
-        seen = set()
-        filtered_emotions = []
-        for emo in found_emotions:
-            if emo not in seen:
-                seen.add(emo)
-                filtered_emotions.append(emo)
-            if len(filtered_emotions) >= self.max_emotions_per_message: break
-
-        clean_text = re.sub(r"&&+", "", clean_text).strip()
-        return clean_text, filtered_emotions
-
-    def _is_likely_emotion_markup(self, markup, text, position):
-        before_text = text[:position].strip()
-        after_text = text[position + len(markup) :].strip()
-        if re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else "") or \
-           re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else ""): return True
-        if re.match(r"\[\d+\]", markup) or " " in markup[1:-1]: return False
-        if re.search(r"[a-zA-Z]\s+$", before_text) and re.search(r"^\s+[a-zA-Z]", after_text): return False
-        return True
-
-    def _is_likely_emotion(self, word, text, position, valid_emotions):
-        before_text = text[:position].strip()
-        after_text = text[position + len(word) :].strip()
-        if re.search(r"[a-zA-Z]\s+$", before_text) or re.search(r"^\s+[a-zA-Z]", after_text): return False
-        if re.search(r"[\u4e00-\u9fff]", before_text[-1:] if before_text else "") or \
-           re.search(r"[\u4e00-\u9fff]", after_text[:1] if after_text else ""): return True
-        if not before_text or before_text.endswith(("。", "，", "！", "？", ".", ",", ":", ";", "!", "?", "\n")): return True
-        if word in self.config.get("high_confidence_emotions", []): return True
-        return False
-
-    # --- 关键架构修正：优先级调整 ---
-    
-    # 优先级设为 3 ( < Retry插件的 5 )
-    # 确保 Retry 插件先执行重试逻辑，修正文本错误。
-    # 然后 MemeSender 再执行，此时看到的已经是“修复后”的文本了。
-    @filter.on_llm_response(priority=3)
-    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
-        """处理 LLM 响应，识别表情"""
-        if not response or not response.completion_text: return
-
-        clean_text, emotions = self._process_text_for_emotions(response.completion_text)
-        
-        if not hasattr(event, "state_data"): event.state_data = {}
-        event.state_data["found_emotions"] = emotions
-        response.completion_text = clean_text
-
-    # 优先级设为 10 ( > 默认值 0 )
-    # 作为一个清理/格式化插件，它应该在大部分逻辑之后运行，但在最终发送之前。
-    # 确保文本被彻底净化，没有残留标签。
-    @filter.on_decorating_result(priority=10)
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """在消息发送前处理文本部分"""
-        result = event.get_result()
-        if not result: return
-
-        state_data = getattr(event, "state_data", {})
-        emotions = state_data.get("found_emotions", [])
-        
-        # 兜底扫描：即使优先级已经调整，作为防御性编程，依然保留对残留标签的扫描
-        current_text = result.get_plain_text()
-        if current_text and ("&&" in current_text or ("[" in current_text and "]" in current_text)):
-             clean_text, new_emotions = self._process_text_for_emotions(current_text)
-             # 如果发现了新表情或者清理了文本，说明有漏网之鱼
-             if new_emotions or clean_text != current_text:
-                 # 合并或覆盖？这里选择合并，因为 resp 可能已经识别了一部分
-                 emotions.extend([e for e in new_emotions if e not in emotions])
-                 if not hasattr(event, "state_data"): event.state_data = {}
-                 event.state_data["found_emotions"] = emotions
-                 
-                 # 强制更新文本链
-                 result.chain = [Plain(clean_text)]
-
-        if not emotions: return
-
-        try:
-            chains = []
-            original_chain = result.chain
-            if original_chain:
-                if isinstance(original_chain, str): chains.append(Plain(original_chain))
-                elif isinstance(original_chain, MessageChain): chains.extend([c for c in original_chain if isinstance(c, Plain)])
-                elif isinstance(original_chain, list): chains.extend([c for c in original_chain if isinstance(c, Plain)])
-
-            cleaned_chains = []
-            for component in chains:
-                if isinstance(component, Plain):
-                    text = component.text
-                    if self.content_cleanup_rule: text = re.sub(self.content_cleanup_rule, "", text)
-                    final_clean, _ = self._process_text_for_emotions(text)
-                    if final_clean.strip(): cleaned_chains.append(Plain(final_clean))
-
-            text_result = event.make_result().set_result_content_type(ResultContentType.LLM_RESULT)
-            for component in cleaned_chains: text_result = text_result.message(component.text)
-
-            if text_result.get_plain_text().strip():
-                event.set_result(text_result)
-            else:
-                await self.after_message_sent(event)
-                event.stop_event()
-        except Exception as e:
-            self.logger.error(f"处理文本失败: {e}")
-
-    @filter.after_message_sent()
-    async def after_message_sent(self, event: AstrMessageEvent):
-        state_data = getattr(event, "state_data", {})
-        emotions = state_data.get("found_emotions", [])
-
-        if not emotions: return
-
-        try:
-            for emotion in emotions:
-                if not emotion: continue
-                meme_file = self._get_next_meme(emotion)
-                if not meme_file: continue
-                meme_path = os.path.join(MEMES_DIR, emotion, meme_file)
-                if not os.path.exists(meme_path): continue
-
-                if random.randint(0, 100) <= self.emotions_probability:
-                    if event.get_platform_name() == "gewechat":
-                        await event.send(MessageChain([Image.fromFileSystem(meme_path)]))
-                    else:
-                        await self.context.send_message(
-                            event.unified_msg_origin,
-                            MessageChain([Image.fromFileSystem(meme_path)]),
-                        )
-            state_data["found_emotions"] = []
-        except Exception as e:
-            self.logger.error(f"发送图片失败: {e}")
-
+    # ==================== 管理命令扩展 (移植自 v18) ====================
     @meme_manager.command("同步状态")
-    async def check_sync_status(self, event: AstrMessageEvent):
+    async def check_sync_status(self, event: AstrMessageEvent, detail: str = None):
+        """[v18移植] 检查表情包与图床的同步状态，支持详细模式"""
         if not self.img_sync:
-            yield event.plain_result("图床服务尚未配置。")
+            yield event.plain_result("图床服务尚未配置，请先配置。")
             return
+
         try:
+            # 获取图床信息
+            provider_name = self.img_sync.provider.__class__.__name__
+            if hasattr(self.img_sync.provider, "bucket_name"):
+                storage_info = f"存储桶: {self.img_sync.provider.bucket_name}"
+            else:
+                storage_info = "未知存储类型"
+
             status = self.img_sync.check_status()
             to_upload = status.get("to_upload", [])
             to_download = status.get("to_download", [])
-            result = ["同步状态检查结果："]
-            if to_upload: result.append(f"\n需要上传({len(to_upload)}): " + ", ".join([f"{f['category']}/{f['filename']}" for f in to_upload[:3]]) + "...")
-            if to_download: result.append(f"\n需要下载({len(to_download)}): " + ", ".join([f"{f['category']}/{f['filename']}" for f in to_download[:3]]) + "...")
-            if not to_upload and not to_download: result.append("🌩️ 已完全同步！")
-            yield event.plain_result("".join(result))
+
+            result = [
+                "📊 图床同步状态报告",
+                "",
+                f"🔧 服务: {provider_name}",
+                f"📁 {storage_info}",
+                "",
+                "📈 统计:",
+                f"  • 待上传: {len(to_upload)}",
+                f"  • 待下载: {len(to_download)}",
+                ""
+            ]
+
+            # 简略展示
+            if to_upload:
+                result.append("📤 待上传(前5):")
+                for file in to_upload[:5]:
+                    result.append(f"  • {file.get('category', '未分类')}/{file['filename']}")
+                if len(to_upload) > 5: result.append("  ...")
+
+            if to_download:
+                result.append("\n📥 待下载(前5):")
+                for file in to_download[:5]:
+                    result.append(f"  • {file.get('category', '未分类')}/{file['filename']}")
+                if len(to_download) > 5: result.append("  ...")
+
+            if not to_upload and not to_download:
+                result.append("✅ 云端与本地已完全同步！")
+
+                # 详细模式逻辑
+                if detail and detail.strip() == "详细":
+                    result.append("\n📋 详细分类统计:")
+                    try:
+                        # 云端统计
+                        if hasattr(self.img_sync.provider, "get_image_list"):
+                            remote_images = self.img_sync.provider.get_image_list()
+                            remote_stats = {}
+                            for img in remote_images:
+                                cat = img.get("category", "未分类")
+                                remote_stats[cat] = remote_stats.get(cat, 0) + 1
+                            
+                            result.append("\n☁️ 云端分布:")
+                            for cat, count in sorted(remote_stats.items(), key=lambda x: x[1], reverse=True):
+                                result.append(f"  • {cat}: {count}")
+                    except Exception as e:
+                        result.append(f"  (获取云端详情失败: {e})")
+
+                    # 本地统计
+                    local_stats = {k: len(v) for k, v in self.image_cache.items()}
+                    result.append("\n💻 本地分布:")
+                    for cat, count in sorted(local_stats.items(), key=lambda x: x[1], reverse=True):
+                        result.append(f"  • {cat}: {count}")
+
+            yield event.plain_result("\n".join(result))
         except Exception as e:
             yield event.plain_result(f"检查失败: {e}")
 
+    @meme_manager.command("图库统计")
+    async def show_library_stats(self, event: AstrMessageEvent):
+        """[v18移植] 显示图库详细统计信息"""
+        try:
+            result = ["📊 图库统计报告", "", "📁 本地:"]
+            
+            # 使用 v20 的缓存数据进行统计
+            local_stats = {k: len(v) for k, v in self.image_cache.items()}
+            local_total = sum(local_stats.values())
+
+            if local_stats:
+                result.append(f"  • 总文件: {local_total}")
+                result.append(f"  • 分类数: {len(local_stats)}")
+                result.append("\n📂 分类详情:")
+                for cat, count in sorted(local_stats.items(), key=lambda x: x[1], reverse=True):
+                    result.append(f"  • {cat}: {count}")
+            else:
+                result.append("  • (空)")
+
+            # 云端统计
+            if self.img_sync:
+                result.append("\n☁️ 云端:")
+                try:
+                    remote_images = self.img_sync.provider.get_image_list()
+                    remote_total = len(remote_images)
+                    result.append(f"  • 总文件: {remote_total}")
+                    
+                    if local_total > remote_total:
+                        result.append(f"  • 📉 本地比云端多 {local_total - remote_total}")
+                    elif remote_total > local_total:
+                        result.append(f"  • 📈 云端比本地多 {remote_total - local_total}")
+                    else:
+                        result.append("  • ✅ 数量一致")
+                except Exception as e:
+                    result.append(f"  (获取失败: {e})")
+            
+            # 空间估算
+            if local_total > 0:
+                size_mb = local_total * 0.5 # 假设平均500KB
+                result.append(f"\n💾 预估占用空间: ~{size_mb:.1f} MB")
+
+            yield event.plain_result("\n".join(result))
+
+        except Exception as e:
+            self.logger.error(f"统计失败: {e}")
+            yield event.plain_result(f"统计失败: {e}")
+
+    # ==================== 核心解析与分段算法 ====================
+
+    def _split_text_by_tags(self, text: str, valid_emoticons: set) -> tuple[list, list]:
+        """
+        [v21核心] 根据标签将文本精准切分为 [Plain, Slot, Plain...]
+        用于配合提示词策略，实现“指哪打哪”的图片插入。
+        """
+        if not text: return [], []
+
+        # 模式解释：捕获 &&...&& 或 [xxx] 或 (xxx) 作为分隔符
+        # 使用捕获组 () 让 split 保留分隔符
+        pattern = r"(&&[^&]+&&|\[[^\[\]]+\]|\([^()]+\))"
+        parts = re.split(pattern, text)
+        
+        components = []
+        found_emotions_in_order = []
+
+        for part in parts:
+            if not part: continue
+
+            is_tag = False
+            emotion = ""
+            
+            # 解析 Tag 内容
+            if part.startswith("&&") and part.endswith("&&"):
+                emotion = part[2:-2].strip()
+                is_tag = True
+            elif part.startswith("[") and part.endswith("]"):
+                emotion = part[1:-1].strip()
+                is_tag = True
+            elif part.startswith("(") and part.endswith(")"):
+                emotion = part[1:-1].strip()
+                is_tag = True
+
+            if is_tag and emotion in valid_emoticons:
+                # 这是一个有效的表情标签 -> 转换为插槽
+                found_emotions_in_order.append(emotion)
+                components.append({"type": "image_slot", "emotion": emotion})
+            else:
+                # 这是一个普通文本，或者无效标签
+                # 如果配置了清理规则且它长得像标签，可以清理，否则保留
+                # 这里为了简单，直接作为文本保留
+                components.append(Plain(part))
+        
+        return components, found_emotions_in_order
+
+    # 优先级设为 3 ( < Retry插件的 5 )
+    @filter.on_llm_response(priority=3)
+    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
+        """
+        [v21修改] LLM 响应处理
+        注意：为了支持 on_decorating_result 的精准分段，这里只做检测记录，
+        **不再** 对文本进行 strip 清理。保留标签给后续步骤使用。
+        """
+        if not response or not response.completion_text: return
+
+        # 我们这里依然调用 parse 逻辑来更新 state_data (用于调试或其他插件消费)
+        # 但我们不再回写 response.completion_text (或者只做最基础的清理)
+        
+        # 使用临时变量解析，不影响原始文本
+        valid_emoticons = set(self.category_mapping.keys())
+        _, emotions = self._split_text_by_tags(response.completion_text, valid_emoticons)
+        
+        if not hasattr(event, "state_data"): event.state_data = {}
+        event.state_data["found_emotions"] = emotions
+        
+        # [CRITICAL] 不要在这里移除 &&tag&&，否则 decorating 阶段无法定位
+        # response.completion_text = clean_text  <-- 注释掉这行
+
+    # 优先级设为 10 ( > 默认值 0 )
+    @filter.on_decorating_result(priority=10)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """
+        [v21核心] 消息组装
+        使用 _split_text_by_tags 将文本标签替换为图片组件
+        """
+        result = event.get_result()
+        if not result: return
+
+        # 1. 获取 LLM 原始文本 (包含 &&tags&&)
+        raw_text = result.get_plain_text()
+        if not raw_text: return
+
+        valid_emoticons = set(self.category_manager.get_descriptions().keys())
+        
+        # 2. 调用精准切割逻辑
+        # mixed_components 包含 Plain 对象和 {"type": "image_slot"} 字典
+        mixed_components, emotions = self._split_text_by_tags(raw_text, valid_emoticons)
+
+        # 更新 state_data 供日志或后续使用
+        if not hasattr(event, "state_data"): event.state_data = {}
+        event.state_data["found_emotions"] = emotions
+
+        if not emotions:
+            # 如果没发现表情，就不做任何修改，直接返回
+            return
+
+        # 3. 实例化图片并替换插槽
+        final_chain = []
+        for comp in mixed_components:
+            if isinstance(comp, Plain):
+                final_chain.append(comp)
+            elif isinstance(comp, dict) and comp.get("type") == "image_slot":
+                # 这是一个插槽，尝试获取图片
+                emotion = comp["emotion"]
+                
+                # 概率控制
+                if random.randint(1, 100) <= self.emotions_probability:
+                    # 使用 v20 的缓存+洗牌算法获取图片
+                    meme_file = self._get_next_meme(emotion)
+                    if meme_file:
+                        meme_path = os.path.join(MEMES_DIR, emotion, meme_file)
+                        try:
+                            final_chain.append(Image.fromFileSystem(meme_path))
+                        except Exception as e:
+                            self.logger.error(f"图片加载失败 {meme_path}: {e}")
+                
+                # 如果没随机中，或者图片加载失败，这个 slot 就消失了
+                # 对应的 &&tag&& 也就被移除，实现了"隐形"
+
+        # 4. 更新消息链
+        if final_chain:
+            result.chain = final_chain
+
+    @filter.after_message_sent()
+    async def after_message_sent(self, event: AstrMessageEvent):
+        """
+        [v21修改] 已在 decorating 阶段处理混排，此处无需操作。
+        """
+        pass
+
+    # ==================== 同步功能 (v20) ====================
     @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("同步到云端")
     async def sync_to_remote(self, event: AstrMessageEvent):
