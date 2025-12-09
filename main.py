@@ -492,12 +492,16 @@ class MemeSender(Star):
     def _split_text_by_tags(self, text: str, valid_emoticons: set) -> tuple[list, list]:
         """
         [v21核心] 根据标签将文本精准切分为 [Plain, Slot, Plain...]
-        用于配合提示词策略，实现“指哪打哪”的图片插入。
+        支持去除 LLM 对定界符的转义 (如 &\&tag&& -> &&tag&&) 以及标签内容的转义
         """
         if not text: return [], []
 
+        # [关键修复] 预处理归一化
+        # 1. 将 \& 替换为 &。这样 &\& 会变成 &&，\&\& 也会变成 &&
+        # 2. 将 \[ 和 \] 替换为 [ 和 ]，防止中括号也被转义
+        text = text.replace(r"\&", "&").replace(r"\[", "[").replace(r"\]", "]")
+
         # 模式解释：捕获 &&...&& 或 [xxx] 或 (xxx) 作为分隔符
-        # 使用捕获组 () 让 split 保留分隔符
         pattern = r"(&&[^&]+&&|\[[^\[\]]+\]|\([^()]+\))"
         parts = re.split(pattern, text)
         
@@ -510,9 +514,10 @@ class MemeSender(Star):
             is_tag = False
             emotion = ""
             
-            # 解析 Tag 内容
+            # --- 解析 Tag 内容 ---
             if part.startswith("&&") and part.endswith("&&"):
-                emotion = part[2:-2].strip()
+                # [二次清洗] 去除标签内容内部可能的转义符（防止 tag\_name 这种情况）
+                emotion = part[2:-2].strip().replace("\\", "") 
                 is_tag = True
             elif part.startswith("[") and part.endswith("]"):
                 emotion = part[1:-1].strip()
@@ -521,14 +526,17 @@ class MemeSender(Star):
                 emotion = part[1:-1].strip()
                 is_tag = True
 
+            # --- 匹配逻辑 ---
             if is_tag and emotion in valid_emoticons:
-                # 这是一个有效的表情标签 -> 转换为插槽
+                # 匹配成功 -> 转换为图片插槽
                 found_emotions_in_order.append(emotion)
                 components.append({"type": "image_slot", "emotion": emotion})
             else:
-                # 这是一个普通文本，或者无效标签
-                # 如果配置了清理规则且它长得像标签，可以清理，否则保留
-                # 这里为了简单，直接作为文本保留
+                # 匹配失败（如无效标签）-> 丢弃 &&...&& 格式的幻觉，保留其他文本
+                if part.startswith("&&") and part.endswith("&&"):
+                    self.logger.debug(f"丢弃无效标签: {part} (清洗后: {emotion})")
+                    continue 
+                
                 components.append(Plain(part))
         
         return components, found_emotions_in_order
