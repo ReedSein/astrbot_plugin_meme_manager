@@ -28,7 +28,7 @@ from .init import init_plugin
 
 
 @register(
-    "meme_manager", "anka", "anka - 表情包管理器 (Pro混排版)", "3.24"
+    "meme_manager", "anka", "anka - 表情包管理器 (Pro混排版)", "3.25"
 )
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -70,12 +70,7 @@ class MemeSender(Star):
         self.emotions_probability = self.config.get("emotions_probability", 80)
         self.content_cleanup_rule = self.config.get("content_cleanup_rule", "&&[a-zA-Z]*&&")
 
-        # --- 性能优化：预编译正则表达式 (保留 v20 特性) ---
-        self.regex_hex = re.compile(r"&&([^&&]+)&&")
-        self.regex_bracket = re.compile(r"\[([^\[\]]+)\]")
-        self.regex_paren = re.compile(r"\(([^()]+)\)")
-        
-        # --- 性能优化：IO 缓存层 (保留 v20 特性) ---
+        # --- 性能优化：IO 缓存层 ---
         self.image_cache = {}  
         self.meme_queues = {}  
         self._refresh_image_cache()
@@ -95,7 +90,6 @@ class MemeSender(Star):
         if image_host_type == "stardots":
             stardots_config = self.config.get("image_host_config", {}).get("stardots", {})
             if stardots_config.get("key") and stardots_config.get("secret"):
-                # 兼容 v18 的 provider 字段
                 stardots_config["provider"] = "stardots"
                 self.img_sync = ImageSync(
                     config={
@@ -120,7 +114,7 @@ class MemeSender(Star):
                 self._r2_bucket_name = r2_config.get("bucket_name")
 
     def _refresh_image_cache(self):
-        """性能优化：刷新图片文件索引缓存 (保留 v20 特性)"""
+        """性能优化：刷新图片文件索引缓存"""
         new_cache = {}
         self.meme_queues = {}
         
@@ -142,7 +136,7 @@ class MemeSender(Star):
         self.logger.info(f"表情包缓存已更新，共加载 {len(new_cache)} 个分类的图片索引")
 
     def _get_next_meme(self, category: str) -> str | None:
-        """体验优化：使用洗牌算法获取下一张图片，防止重复 (保留 v20 特性)"""
+        """体验优化：使用洗牌算法获取下一张图片，防止重复"""
         if category not in self.image_cache:
             return None
             
@@ -173,7 +167,7 @@ class MemeSender(Star):
         for persona, persona_backup in zip(personas, self.persona_backup):
             persona["prompt"] = persona_backup["prompt"] + self.sys_prompt_add
 
-    # ==================== WebUI 管理命令 (v20) ====================
+    # ==================== WebUI 管理命令 ====================
     @filter.command_group("表情管理")
     def meme_manager(self):
         pass
@@ -364,10 +358,10 @@ class MemeSender(Star):
         except Exception as e:
             self.logger.error(f"Reload失败: {e}")
 
-    # ==================== 管理命令扩展 (移植自 v18) ====================
+    # ==================== 管理命令扩展 ====================
     @meme_manager.command("同步状态")
     async def check_sync_status(self, event: AstrMessageEvent, detail: str = None):
-        """[v18移植] 检查表情包与图床的同步状态，支持详细模式"""
+        """检查表情包与图床的同步状态，支持详细模式"""
         if not self.img_sync:
             yield event.plain_result("图床服务尚未配置，请先配置。")
             return
@@ -442,7 +436,7 @@ class MemeSender(Star):
 
     @meme_manager.command("图库统计")
     async def show_library_stats(self, event: AstrMessageEvent):
-        """[v18移植] 显示图库详细统计信息"""
+        """显示图库详细统计信息"""
         try:
             result = ["📊 图库统计报告", "", "📁 本地:"]
             
@@ -486,6 +480,32 @@ class MemeSender(Star):
         except Exception as e:
             self.logger.error(f"统计失败: {e}")
             yield event.plain_result(f"统计失败: {e}")
+
+    @meme_manager.command("同步到云端")
+    async def sync_to_remote(self, event: AstrMessageEvent):
+        if not self.img_sync:
+            yield event.plain_result("图床未配置。")
+            return
+        try:
+            yield event.plain_result("⚡ 开始云端同步...")
+            if await self.img_sync.start_sync("upload"): yield event.plain_result("同步完成！")
+            else: yield event.plain_result("同步失败，请看日志。")
+        except Exception as e:
+            self.logger.error(f"同步失败: {e}")
+
+    @meme_manager.command("从云端同步")
+    async def sync_from_remote(self, event: AstrMessageEvent):
+        if not self.img_sync:
+            yield event.plain_result("图床未配置。")
+            return
+        try:
+            yield event.plain_result("⚡ 开始下载...")
+            if await self.img_sync.start_sync("download"):
+                yield event.plain_result("下载完成！")
+                await self.reload_emotions()
+            else: yield event.plain_result("下载失败，请看日志。")
+        except Exception as e:
+            self.logger.error(f"同步失败: {e}")
 
     # ==================== 核心解析与分段算法 ====================
 
@@ -533,6 +553,7 @@ class MemeSender(Star):
                 components.append({"type": "image_slot", "emotion": emotion})
             else:
                 # 匹配失败（如无效标签）-> 丢弃 &&...&& 格式的幻觉，保留其他文本
+                # 注意：这里丢弃的是"未匹配成功"的标签，防止它们变成普通文本被发出去
                 if part.startswith("&&") and part.endswith("&&"):
                     self.logger.debug(f"丢弃无效标签: {part} (清洗后: {emotion})")
                     continue 
@@ -541,30 +562,22 @@ class MemeSender(Star):
         
         return components, found_emotions_in_order
 
-    # 优先级设为 3 ( < Retry插件的 5 )
+    # 优先级设为 3
     @filter.on_llm_response(priority=3)
     async def resp(self, event: AstrMessageEvent, response: LLMResponse):
         """
         [v21修改] LLM 响应处理
-        注意：为了支持 on_decorating_result 的精准分段，这里只做检测记录，
-        **不再** 对文本进行 strip 清理。保留标签给后续步骤使用。
+        仅记录检测到的表情，不修改原始文本，交由 decorating 阶段处理
         """
         if not response or not response.completion_text: return
 
-        # 我们这里依然调用 parse 逻辑来更新 state_data (用于调试或其他插件消费)
-        # 但我们不再回写 response.completion_text (或者只做最基础的清理)
-        
-        # 使用临时变量解析，不影响原始文本
         valid_emoticons = set(self.category_mapping.keys())
         _, emotions = self._split_text_by_tags(response.completion_text, valid_emoticons)
         
         if not hasattr(event, "state_data"): event.state_data = {}
         event.state_data["found_emotions"] = emotions
-        
-        # [CRITICAL] 不要在这里移除 &&tag&&，否则 decorating 阶段无法定位
-        # response.completion_text = clean_text  <-- 注释掉这行
 
-    # 优先级设为 10 ( > 默认值 0 )
+    # 优先级设为 10：主要处理逻辑
     @filter.on_decorating_result(priority=10)
     async def on_decorating_result(self, event: AstrMessageEvent):
         """
@@ -574,36 +587,25 @@ class MemeSender(Star):
         result = event.get_result()
         if not result: return
 
-        # 1. 获取 LLM 原始文本 (包含 &&tags&&)
         raw_text = result.get_plain_text()
         if not raw_text: return
 
         valid_emoticons = set(self.category_manager.get_descriptions().keys())
-        
-        # 2. 调用精准切割逻辑
-        # mixed_components 包含 Plain 对象和 {"type": "image_slot"} 字典
         mixed_components, emotions = self._split_text_by_tags(raw_text, valid_emoticons)
 
-        # 更新 state_data 供日志或后续使用
         if not hasattr(event, "state_data"): event.state_data = {}
         event.state_data["found_emotions"] = emotions
 
         if not emotions:
-            # 如果没发现表情，就不做任何修改，直接返回
             return
 
-        # 3. 实例化图片并替换插槽
         final_chain = []
         for comp in mixed_components:
             if isinstance(comp, Plain):
                 final_chain.append(comp)
             elif isinstance(comp, dict) and comp.get("type") == "image_slot":
-                # 这是一个插槽，尝试获取图片
                 emotion = comp["emotion"]
-                
-                # 概率控制
                 if random.randint(1, 100) <= self.emotions_probability:
-                    # 使用 v20 的缓存+洗牌算法获取图片
                     meme_file = self._get_next_meme(emotion)
                     if meme_file:
                         meme_path = os.path.join(MEMES_DIR, emotion, meme_file)
@@ -611,49 +613,55 @@ class MemeSender(Star):
                             final_chain.append(Image.fromFileSystem(meme_path))
                         except Exception as e:
                             self.logger.error(f"图片加载失败 {meme_path}: {e}")
-                
-                # 如果没随机中，或者图片加载失败，这个 slot 就消失了
-                # 对应的 &&tag&& 也就被移除，实现了"隐形"
-
-        # 4. 更新消息链
+        
         if final_chain:
             result.chain = final_chain
 
+    # 优先级设为 -999：【新增】兜底清理机制
+    @filter.on_decorating_result(priority=-999)
+    async def cleanup_residual_tags(self, event: AstrMessageEvent):
+        """
+        [v21.2] 兜底清理机制
+        这是消息发送前的最后一道防线。
+        如果上述逻辑有任何遗漏，或者被其他低优先级插件修改，
+        此处将无情地移除所有残留的 &&...&& 标签，确保用户绝不会看到乱码。
+        """
+        result = event.get_result()
+        if not result or not result.chain: return
+
+        new_chain = []
+        chain_modified = False
+
+        for comp in result.chain:
+            if isinstance(comp, Plain) and comp.text:
+                # 预处理：归一化定界符，确保正则能匹配到
+                # 这样即使是 &\&poison&& 这种畸形文本也会被还原成 &&poison&& 从而被正则捕获
+                text = comp.text.replace(r"\&", "&")
+                
+                # 正则：匹配 &&任意内容&&
+                # 使用非贪婪模式 .*? 防止跨标签误删
+                if "&&" in text:
+                    cleaned_text = re.sub(r"&&.*?&&", "", text)
+                    # 如果内容发生了变化，且变化后不为空，则添加
+                    # 如果变化后为空（说明全是脏标签），则不添加
+                    if cleaned_text != comp.text:
+                        if cleaned_text:
+                            new_chain.append(Plain(cleaned_text))
+                        chain_modified = True
+                    else:
+                        new_chain.append(comp)
+                else:
+                    new_chain.append(comp)
+            else:
+                new_chain.append(comp)
+
+        if chain_modified:
+            result.chain = new_chain
+            self.logger.debug("触发兜底清理，已移除残留标签。")
+
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
-        """
-        [v21修改] 已在 decorating 阶段处理混排，此处无需操作。
-        """
         pass
-
-    # ==================== 同步功能 (v20) ====================
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @meme_manager.command("同步到云端")
-    async def sync_to_remote(self, event: AstrMessageEvent):
-        if not self.img_sync:
-            yield event.plain_result("图床未配置。")
-            return
-        try:
-            yield event.plain_result("⚡ 开始云端同步...")
-            if await self.img_sync.start_sync("upload"): yield event.plain_result("同步完成！")
-            else: yield event.plain_result("同步失败，请看日志。")
-        except Exception as e:
-            self.logger.error(f"同步失败: {e}")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @meme_manager.command("从云端同步")
-    async def sync_from_remote(self, event: AstrMessageEvent):
-        if not self.img_sync:
-            yield event.plain_result("图床未配置。")
-            return
-        try:
-            yield event.plain_result("⚡ 开始下载...")
-            if await self.img_sync.start_sync("download"):
-                yield event.plain_result("下载完成！")
-                await self.reload_emotions()
-            else: yield event.plain_result("下载失败，请看日志。")
-        except Exception as e:
-            self.logger.error(f"同步失败: {e}")
 
     async def terminate(self):
         personas = self.context.provider_manager.personas
